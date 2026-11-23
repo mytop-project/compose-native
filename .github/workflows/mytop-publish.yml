@@ -1,0 +1,354 @@
+name: Publish patched Compose Native (mytop)
+
+# Our patched build of compose-native's desktop-native closure for linuxX64, linuxArm64 and mingwX64.
+# It publishes nothing to Maven Central and nothing under anyone's coordinates: the version carries our
+# own suffix (MYTOP_VERSION, such as 1.13.0-beta01-mytop.1), and the result is one Maven repository
+# (a tar.gz) attached to a GitHub release of this fork, which a Gradle build adds as a file repository
+# after checking its sha256. A release is never overwritten: a version already released is skipped.
+#
+# The three native shards are the ones of publish-compose-native-central.yml, unchanged. Only the
+# assembly differs: the platforms of the other shards (Android, JS, JVM, iOS, macOS) are not built, the
+# roots are generated from the platforms that were (--all-platforms reads what is in the repository), and
+# nothing is signed or uploaded to Central.
+on:
+  push:
+    branches: ['mytop']
+
+concurrency:
+  group: mytop-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Read the version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read MYTOP_VERSION
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d ' \r\n' < MYTOP_VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+-mytop\.[0-9]+$ ]]; then
+            echo "MYTOP_VERSION must look like 1.13.0-beta01-mytop.1, not '$version'" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  native:
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            id: linux-x64
+            runner: ubuntu-24.04
+            platform: LinuxX64
+          - name: Linux arm64
+            id: linux-arm64
+            runner: ubuntu-24.04
+            platform: LinuxArm64
+          - name: Windows x64
+            id: windows-x64
+            runner: windows-2022
+            platform: MingwX64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        name: Set up JDK 21
+        with:
+          distribution: corretto
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Export AndroidX JDK location
+        shell: bash
+        run: echo "ANDROIDX_JDK21=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Install Linux native headers
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libgl-dev \
+            libpng-dev \
+            libwayland-dev \
+            libx11-dev \
+            pkg-config \
+            zlib1g-dev
+          sdl_archive="$RUNNER_TEMP/SDL3-3.4.10.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$sdl_archive" \
+            https://github.com/libsdl-org/SDL/releases/download/release-3.4.10/SDL3-3.4.10.tar.gz
+          echo '12b34280415ec8418c864408b93d008a20a6530687ee613d60bfbd20411f2785  '"$sdl_archive" | sha256sum --check
+          tar --extract --gzip --file "$sdl_archive" --directory "$RUNNER_TEMP"
+          sudo cp --recursive "$RUNNER_TEMP/SDL3-3.4.10/include/SDL3" /usr/include/
+          dbus_arch_include="$(pkg-config --variable=libdir dbus-1)/dbus-1.0/include"
+          sudo mkdir --parents /usr/lib/dbus-1.0
+          if [[ ! -e /usr/lib/dbus-1.0/include ]]; then
+            sudo ln --symbolic "$dbus_arch_include" /usr/lib/dbus-1.0/include
+          fi
+
+      - name: Publish target to an isolated Maven repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          COMPOSE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          repository="$GITHUB_WORKSPACE/release/maven-local"
+          gradle_command='./gradlew'
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            gradle_command='./gradlew.bat'
+          fi
+          "$gradle_command" \
+            --no-daemon \
+            --stacktrace \
+            --no-configuration-cache \
+            --configure-on-demand \
+            "-Dmaven.repo.local=$repository" \
+            "-Pcompose.platforms=$COMPOSE_PLATFORM" \
+            -Pjetbrains.publication.groupPrefix=dev.brahmkshatriya \
+            "-PcomposeNativeVersion=$RELEASE_VERSION" \
+            :mpp:publishComposeNativeToMavenLocal
+
+          if [[ "$COMPOSE_PLATFORM" == 'LinuxX64' ]]; then
+            # Root metadata must see the complete published KMP topology. A partial target set can
+            # collapse shared source sets or omit platform variants from Gradle module metadata.
+            # Configure every platform family here so KGP preserves Android/JVM/Web/iOS/Desktop
+            # Native variants while also publishing desktopNativeMain (all desktop Native targets)
+            # and linuxWindowsMain (Linux + Windows) as distinct metadata fragments. Leaf artifacts
+            # are still published by their dedicated platform shards.
+            "$gradle_command" \
+              --no-daemon \
+              --stacktrace \
+              --no-configuration-cache \
+              --no-configure-on-demand \
+              "-Dmaven.repo.local=$repository" \
+              -Pcompose.platforms=Android,Desktop,Js,WasmJs,MacosX64,MacosArm64,IosArm64,IosSimulatorArm64,LinuxX64,LinuxArm64,MingwX64 \
+              -Pjetbrains.publication.groupPrefix=dev.brahmkshatriya \
+              "-PcomposeNativeVersion=$RELEASE_VERSION" \
+              :mpp:publishComposeForkRootsToMavenLocal \
+              -x checkKotlinGradlePluginConfigurationErrors \
+              --rerun-tasks
+            # Shared desktop API metadata is compiled independently of platform binaries.
+            # Only header commonization needs a second native target here.
+            shared_metadata="$RUNNER_TEMP/compose-native-shared-metadata"
+            "$gradle_command" \
+              --no-daemon --no-configuration-cache --configure-on-demand \
+              "-Dmaven.repo.local=$repository" \
+              -Pcompose.platforms=LinuxX64,LinuxArm64,Js \
+              -Pcompose.native.publish.sharedMetadata=true \
+              "-Pcompose.native.sharedMetadataDirectory=$shared_metadata" \
+              -Pjetbrains.publication.groupPrefix=dev.brahmkshatriya \
+              "-PcomposeNativeVersion=$RELEASE_VERSION" \
+              :compose:desktop:desktop-native:prepareSharedDesktopMetadata
+            python3 scripts/write-linux-native-root-metadata.py \
+              --repository "$repository" --version "$RELEASE_VERSION" \
+              --group dev.brahmkshatriya.compose.desktop --module desktop-native \
+              --desktop-native-shared-metadata "$shared_metadata"
+          fi
+
+      - name: Export only fork publications
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="$GITHUB_WORKSPACE/release/maven-local/dev/brahmkshatriya"
+          export_root="$GITHUB_WORKSPACE/release/export/dev/brahmkshatriya"
+          mkdir -p "$export_root"
+          for namespace in compose androidx; do
+            if [[ -d "$repository/$namespace" ]]; then
+              cp -R "$repository/$namespace" "$export_root/"
+            fi
+          done
+          test -d "$export_root/compose"
+
+      - uses: actions/upload-artifact@v4
+        name: Upload ${{ matrix.name }} repository
+        with:
+          name: compose-native-repo-${{ matrix.id }}-${{ needs.prepare.outputs.version }}
+          path: release/export
+          if-no-files-found: error
+          retention-days: 5
+
+  assemble:
+    name: Assemble the Maven repository
+    needs:
+      - prepare
+      - native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        name: Set up JDK 21
+        with:
+          distribution: corretto
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: actions/download-artifact@v4
+        name: Download platform Maven repositories
+        with:
+          pattern: compose-native-repo-*-${{ needs.prepare.outputs.version }}
+          path: release/platform-repositories
+
+      - name: Merge platform Maven repositories
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release/merged-repository
+          for repository in release/platform-repositories/compose-native-repo-*-"$RELEASE_VERSION"; do
+            cp -a "$repository/." release/merged-repository/
+          done
+
+      - name: Generate aggregate KMP roots
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          upstream_compose="$(sed -n 's/^compose.native.upstream.version.COMPOSE=//p' gradle.properties | tail -n1)"
+          upstream_material3="$(sed -n 's/^compose.native.upstream.version.COMPOSE_MATERIAL3=//p' gradle.properties | tail -n1)"
+          upstream_lifecycle="$(sed -n 's/^compose.native.upstream.version.LIFECYCLE=//p' gradle.properties | tail -n1)"
+          upstream_navigation3="$(sed -n 's/^compose.native.upstream.version.NAVIGATION_3=//p' gradle.properties | tail -n1)"
+          upstream_navigationevent="$(sed -n 's/^compose.native.upstream.version.NAVIGATION_EVENT=//p' gradle.properties | tail -n1)"
+          upstream_savedstate="$(sed -n 's/^compose.native.upstream.version.SAVEDSTATE=//p' gradle.properties | tail -n1)"
+          native_skiko_group="$(sed -n 's/^compose.native.skiko.group=//p' gradle.properties | tail -n1)"
+          native_skiko_version="$(sed -n 's/^compose.native.skiko.version=//p' gradle.properties | tail -n1)"
+          python3 scripts/write-linux-native-root-metadata.py \
+            --repository release/merged-repository \
+            --version "$RELEASE_VERSION" \
+            --group-prefix dev.brahmkshatriya \
+            --upstream-compose-version "$upstream_compose" \
+            --upstream-material3-version "$upstream_material3" \
+            --upstream-lifecycle-version "$upstream_lifecycle" \
+            --upstream-navigation3-version "$upstream_navigation3" \
+            --upstream-navigationevent-version "$upstream_navigationevent" \
+            --upstream-savedstate-version "$upstream_savedstate" \
+            --native-skiko-group "$native_skiko_group" \
+            --native-skiko-version "$native_skiko_version" \
+            --all-platforms
+
+
+      - name: Publish Gradle plugin into the merged repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "ANDROIDX_JDK21=$JAVA_HOME" >> "$GITHUB_ENV"
+          ./gradlew \
+            -p gradle-plugin \
+            --no-daemon \
+            --stacktrace \
+            --no-configuration-cache \
+            "-Dmaven.repo.local=$GITHUB_WORKSPACE/release/merged-repository" \
+            "-PcomposeNativeVersion=$RELEASE_VERSION" \
+            publishToMavenLocal
+
+
+      - name: Check the repository has what a Linux and Windows consumer resolves
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          group_root='release/merged-repository/dev/brahmkshatriya'
+          leaked="$(find "$group_root" -type d -name '*SNAPSHOT*' -print -quit)"
+          test -z "$leaked" || { echo "A SNAPSHOT directory leaked into the repository: $leaked" >&2; exit 1; }
+          leaked="$(find "$group_root" -type f \( -name '*.module' -o -name '*.pom' \) -exec grep -Il 'SNAPSHOT' {} + | head -n 1 || true)"
+          test -z "$leaked" || { echo "A SNAPSHOT dependency leaked into the metadata: $leaked" >&2; exit 1; }
+          for module in ui-linuxx64 ui-linuxarm64 ui-mingwx64; do
+            test -d "$group_root/compose/ui/$module/$RELEASE_VERSION"
+          done
+          for suffix in linuxx64 linuxarm64 mingwx64; do
+            found="$(find "$group_root/compose/desktop" -path "*desktop-native*$suffix/$RELEASE_VERSION/*.module" -print -quit)"
+            test -n "$found" || { echo "No desktop-native $suffix publication" >&2; exit 1; }
+          done
+          desktop_root="$group_root/compose/desktop/desktop-native/$RELEASE_VERSION/desktop-native-$RELEASE_VERSION.module"
+          test -s "$desktop_root"
+          jq -e '.variants[] | select(.name == "metadataApiElements")' "$desktop_root" >/dev/null
+          targets="$(jq -r '.variants[].attributes["org.jetbrains.kotlin.native.target"] // empty' \
+            "$group_root/compose/ui/ui/$RELEASE_VERSION/ui-$RELEASE_VERSION.module" | sort -u)"
+          test "$targets" = $'linux_arm64\nlinux_x64\nmingw_x64'
+          found="$(find "$group_root" -name "compose-gradle-plugin-$RELEASE_VERSION.jar" -print -quit)"
+          test -n "$found" || { echo "The Gradle plugin was not published" >&2; exit 1; }
+
+      - name: Pack the repository
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release/dist
+          archive="release/dist/compose-native-maven-$RELEASE_VERSION.tar.gz"
+          tar --sort=name --mtime='2026-01-01 00:00:00' --owner=0 --group=0 --numeric-owner \
+            -czf "$archive" -C release/merged-repository dev
+          (cd release/dist && sha256sum "compose-native-maven-$RELEASE_VERSION.tar.gz" > "compose-native-maven-$RELEASE_VERSION.tar.gz.sha256")
+          cat "release/dist/compose-native-maven-$RELEASE_VERSION.tar.gz.sha256"
+          ls -l release/dist
+
+      - uses: actions/upload-artifact@v4
+        name: Upload the Maven repository
+        with:
+          name: mytop-maven-repository-${{ needs.prepare.outputs.version }}
+          path: release/dist
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach the repository to a release
+    needs:
+      - prepare
+      - assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mytop-maven-repository-${{ needs.prepare.outputs.version }}
+          path: dist
+
+      - name: Create the release unless this version has one
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag exists; a released version is never replaced. Bump MYTOP_VERSION for a new build."
+            exit 0
+          fi
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Compose Native $RELEASE_VERSION (mytop)" \
+            --notes "A Maven repository (dev/brahmkshatriya/...) of compose-native's desktop-native closure for linuxX64, linuxArm64 and mingwX64, built from commit $GITHUB_SHA of the mytop branch. Add it as a file repository after checking the sha256; it is not on Maven Central."

@@ -186,6 +186,25 @@ std::vector<WaylandContext *> wayland_contexts;
 std::vector<std::pair<SDL_Window *, WindowShadow *>> window_shadows;
 std::vector<std::pair<SDL_Window *, X11WindowShadow *>> x11_window_shadows;
 
+// SDL can give an SDL_Window a new X window (SDL_RecreateWindow, for example when a renderer is made
+// on a window that was created for OpenGL), so an X window id kept from an earlier call can name a
+// window that no longer exists. Any request on it is a BadWindow error, and Xlib's default handler
+// ends the process on it. Everything here that talks to the window's X window reads the display and
+// the window from SDL again first, and does nothing when SDL has no X window for it any more.
+bool x11_window_of(SDL_Window *window, Display **display, Window *xwindow) {
+    if (!window) return false;
+    const SDL_PropertiesID properties = SDL_GetWindowProperties(window);
+    if (!properties) return false;
+    Display *current_display = static_cast<Display *>(SDL_GetPointerProperty(
+        properties, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
+    const Window current_window = static_cast<Window>(SDL_GetNumberProperty(
+        properties, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
+    if (!current_display || current_window == None) return false;
+    *display = current_display;
+    *xwindow = current_window;
+    return true;
+}
+
 void destroy_shadow_buffer(ShadowBuffer *buffer) {
     if (buffer->buffer) wl_buffer_destroy(buffer->buffer);
     if (buffer->data && buffer->size) munmap(buffer->data, buffer->size);
@@ -273,10 +292,14 @@ void remove_x11_window_shadow(SDL_Window *window) {
         [window](const auto &entry) { return entry.first == window; });
     if (iterator == x11_window_shadows.end()) return;
     X11WindowShadow *window_shadow = iterator->second;
-    if (window_shadow->display && window_shadow->window != None) {
-        const Atom shadow_atom =
-            XInternAtom(window_shadow->display, "_KDE_NET_WM_SHADOW", False);
-        XDeleteProperty(window_shadow->display, window_shadow->window, shadow_atom);
+    if (window_shadow->display) {
+        Display *live_display = nullptr;
+        Window live_window = None;
+        if (x11_window_of(window, &live_display, &live_window) && live_display == window_shadow->display) {
+            const Atom shadow_atom =
+                XInternAtom(window_shadow->display, "_KDE_NET_WM_SHADOW", False);
+            XDeleteProperty(window_shadow->display, live_window, shadow_atom);
+        }
         for (Pixmap pixmap : window_shadow->pixmaps) {
             if (pixmap != None) XFreePixmap(window_shadow->display, pixmap);
         }
@@ -836,6 +859,7 @@ bool wayland_start(
 }
 
 struct X11Drag {
+    SDL_Window *sdl_window = nullptr;
     Display *display = nullptr;
     Window source = 0;
     Window root = 0;
@@ -858,6 +882,11 @@ struct X11Drag {
     Atom utf8_string = None;
     Atom text_plain = None;
 };
+
+// The drag's display and source window as SDL has them now; false when SDL has no X window for it.
+bool x11_refresh_source(X11Drag *drag) {
+    return x11_window_of(drag->sdl_window, &drag->display, &drag->source);
+}
 
 bool has_xdnd_aware(X11Drag *drag, Window window) {
     Atom actual = None;
@@ -943,7 +972,7 @@ void x11_leave(X11Drag *drag) {
 }
 
 void x11_update_target(X11Drag *drag) {
-    if (!drag->active) return;
+    if (!drag->active || !x11_refresh_source(drag)) return;
     int root_x = 0;
     int root_y = 0;
     const Window next = find_aware_target(drag, &root_x, &root_y);
@@ -974,16 +1003,20 @@ void x11_update_target(X11Drag *drag) {
 }
 
 void x11_finish(X11Drag *drag) {
+    // With no X window left there is no property of ours to delete, and a request on the one
+    // read at create time would be a BadWindow error.
+    const bool window_alive = x11_refresh_source(drag);
     x11_leave(drag);
     XSetSelectionOwner(drag->display, drag->xdnd_selection, None, CurrentTime);
-    XDeleteProperty(drag->display, drag->source, drag->xdnd_type_list);
+    if (window_alive) XDeleteProperty(drag->display, drag->source, drag->xdnd_type_list);
     XFlush(drag->display);
     drag->active = false;
     drag->text.clear();
     drag->uri_list.clear();
 }
 
-bool x11_init(X11Drag *drag, Display *display, Window source) {
+bool x11_init(X11Drag *drag, SDL_Window *sdl_window, Display *display, Window source) {
+    drag->sdl_window = sdl_window;
     drag->display = display;
     drag->source = source;
     drag->root = DefaultRootWindow(display);
@@ -1006,6 +1039,7 @@ bool x11_init(X11Drag *drag, Display *display, Window source) {
 
 bool x11_start(X11Drag *drag, const char *text, const char *uris) {
     x11_finish(drag);
+    if (!x11_refresh_source(drag)) return false;
     drag->text = text ? text : "";
     drag->uri_list = uris ? uris : "";
     drag->active = true;
@@ -1016,6 +1050,10 @@ bool x11_start(X11Drag *drag, const char *text, const char *uris) {
 
 void x11_release(X11Drag *drag) {
     if (!drag->active) return;
+    if (!x11_refresh_source(drag)) {
+        x11_finish(drag);
+        return;
+    }
     x11_update_target(drag);
     if (drag->target && drag->accepted) {
         send_client(drag->display, drag->target, drag->xdnd_drop, drag->source, 0, CurrentTime, 0, 0);
@@ -1138,7 +1176,7 @@ void *kdrag_create(void *raw_window, char **error_message) {
         }
     } else if (x11_display && x11_window != None) {
         drag->backend = Backend::X11;
-        x11_init(&drag->x11, x11_display, x11_window);
+        x11_init(&drag->x11, window, x11_display, x11_window);
         register_x11_drag(drag);
     } else {
         set_error(error_message, "Outgoing drag is supported only by SDL Wayland and X11 backends");
