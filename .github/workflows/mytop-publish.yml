@@ -10,12 +10,24 @@ name: Publish patched Compose Native (mytop)
 # assembly differs: the platforms of the other shards (Android, JS, JVM, iOS, macOS) are not built, the
 # roots are generated from the platforms that were (--all-platforms reads what is in the repository), and
 # nothing is signed or uploaded to Central.
+#
+# It also runs when mytop-sync.yml calls it (workflow_call) on a sync branch: then `ref` is the branch to
+# build, and no release is made (only a push to mytop releases).
 on:
   push:
     branches: ['mytop']
+    paths-ignore:
+      - 'MYTOP.md'
+      - '.github/workflows/mytop-sync.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The branch or commit to build'
+        type: string
+        default: ''
 
 concurrency:
-  group: mytop-publish-${{ github.ref }}
+  group: mytop-publish-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -29,6 +41,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Read MYTOP_VERSION
         id: version
@@ -65,6 +79,8 @@ jobs:
             platform: MingwX64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-java@v4
         name: Set up JDK 21
@@ -199,6 +215,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-java@v4
         name: Set up JDK 21
@@ -322,6 +340,7 @@ jobs:
 
   release:
     name: Attach the repository to a release
+    if: github.event_name == 'push'
     needs:
       - prepare
       - assemble

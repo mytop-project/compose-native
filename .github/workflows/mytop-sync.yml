@@ -1,0 +1,152 @@
+name: Sync upstream into mytop
+
+# Keeps the fork current with brahmkshatriya/compose-native without ever rewriting history:
+#
+# 1. main is fast-forwarded from upstream's main (GitHub's merge-upstream; it is an exact copy of upstream's
+#    main and carries none of our changes).
+# 2. When upstream's main has commits mytop lacks, a new branch sync/<date> is made from mytop and upstream's
+#    main is merged into it (a merge commit; nothing is rebased). A conflict leaves no branch, and the summary
+#    says so.
+# 3. A clean sync branch is built with mytop-publish.yml (the same build, on that branch, without a release).
+#
+# The run summary says what happened. Nothing is opened publicly, mytop is never pushed to and
+# MYTOP_VERSION is never changed: a person reviews the branch and does the steps in MYTOP.md.
+#
+# A push with GITHUB_TOKEN cannot change files under .github/workflows; if upstream changed one, the merge is
+# refused and the summary says so (a person with that permission merges it by hand).
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      rebuild_without_changes:
+        description: 'Make a sync branch and build it even when upstream has nothing new (checks the pipeline)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: mytop-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Fast-forward main and merge it into a sync branch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      result: ${{ steps.merge.outputs.result }}
+      branch: ${{ steps.merge.outputs.branch }}
+      upstream: ${{ steps.merge.outputs.upstream }}
+      detail: ${{ steps.merge.outputs.detail }}
+    steps:
+      - name: Fast-forward main from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result="$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main)"
+          echo "$result"
+          type="$(echo "$result" | jq -r .merge_type)"
+          if [ "$type" = merge ]; then
+            echo "::warning::main had commits of its own, so a merge commit was made instead of a fast-forward"
+          fi
+
+      - name: Merge upstream into a new sync branch
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.rebuild_without_changes }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          main_sha="$(gh api "repos/$repo/branches/main" -q .commit.sha)"
+          mytop_sha="$(gh api "repos/$repo/branches/mytop" -q .commit.sha)"
+          ahead="$(gh api "repos/$repo/compare/mytop...$main_sha" -q .ahead_by)"
+          echo "upstream=$main_sha" >> "$GITHUB_OUTPUT"
+          if [ "$ahead" = 0 ] && [ "$FORCE" != true ]; then
+            echo "result=none" >> "$GITHUB_OUTPUT"
+            echo "detail=mytop already has everything in main ($main_sha)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          name="sync/$(date -u +%Y-%m-%d)"
+          n=1
+          while gh api "repos/$repo/git/ref/heads/$name" >/dev/null 2>&1; do
+            n=$((n + 1))
+            name="sync/$(date -u +%Y-%m-%d)-$n"
+          done
+          gh api -X POST "repos/$repo/git/refs" -f ref="refs/heads/$name" -f sha="$mytop_sha" >/dev/null
+          if [ "$ahead" = 0 ]; then
+            echo "result=rebuilt" >> "$GITHUB_OUTPUT"
+            echo "branch=$name" >> "$GITHUB_OUTPUT"
+            echo "detail=$name is mytop as it is ($mytop_sha); upstream had nothing new" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          out="$(gh api -X POST "repos/$repo/merges" -f base="$name" -f head="$main_sha" \
+            -f commit_message="Merge upstream main (${main_sha:0:10}) into mytop" 2>&1)"
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            gh api -X DELETE "repos/$repo/git/refs/heads/$name" >/dev/null || true
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            echo "detail=upstream main $main_sha does not merge into mytop: $(echo "$out" | tr '\n' ' ' | cut -c1-300)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "result=merged" >> "$GITHUB_OUTPUT"
+          echo "branch=$name" >> "$GITHUB_OUTPUT"
+          echo "detail=upstream main $main_sha is merged into $name ($ahead new upstream commits)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build the sync branch
+    needs: sync
+    if: needs.sync.outputs.result == 'merged' || needs.sync.outputs.result == 'rebuilt'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/mytop-publish.yml
+    with:
+      ref: ${{ needs.sync.outputs.branch }}
+
+  summary:
+    name: Summary
+    needs:
+      - sync
+      - build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Write the summary
+        env:
+          RESULT: ${{ needs.sync.outputs.result }}
+          BRANCH: ${{ needs.sync.outputs.branch }}
+          DETAIL: ${{ needs.sync.outputs.detail }}
+          SYNC_JOB: ${{ needs.sync.result }}
+          BUILD_JOB: ${{ needs.build.result }}
+        run: |
+          {
+            echo "## Upstream sync"
+            echo
+            if [ "$SYNC_JOB" != success ]; then
+              echo "The sync step itself failed ($SYNC_JOB): main could not be fast-forwarded or the branch could not be made. See the log of the sync job."
+            else
+              echo "$DETAIL"
+              echo
+              case "$RESULT" in
+                none) echo "Nothing to do." ;;
+                conflict) echo "No branch was left. Merge upstream main into a branch of mytop by hand and resolve the conflict (MYTOP.md)." ;;
+                merged|rebuilt)
+                  echo "Branch: $BRANCH"
+                  echo "Build of that branch: $BUILD_JOB"
+                  echo
+                  if [ "$BUILD_JOB" = success ]; then
+                    echo "To take it: bump MYTOP_VERSION on the branch, merge the branch into mytop, and the push of mytop publishes (MYTOP.md)."
+                  else
+                    echo "The build did not pass; the branch is left as it is for a person to look at."
+                  fi
+                  ;;
+              esac
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
